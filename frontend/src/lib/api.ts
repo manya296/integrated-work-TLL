@@ -1,388 +1,233 @@
-// API Layer for the Async Execution System Frontend
-// Production-grade: NO mock data, NO fallbacks. All data comes from the live backend.
-//
-// Requests target the SAME-ORIGIN path `/api/v1`, which Next.js (see
-// next.config.ts `rewrites`) and Nginx (production) transparently proxy to the
-// FastAPI backend. Calling a relative path avoids cross-origin/CORS failures,
-// HTTP/HTTPS mismatches, and broken absolute URLs — the historical cause of the
-// browser's opaque "Failed to fetch" error. The backend location is configured
-// server-side via NEXT_PUBLIC_API_URL (used by the proxy), not in the browser.
-const API_BASE_URL = '/api/v1';
+"use client"
 
-// ---------------------------------------------------------------------------
-// Error Handling
-// ---------------------------------------------------------------------------
+import React, { useState, useEffect } from "react"
+import { Cpu, ShieldAlert, Zap, Layers, RefreshCw, Terminal, CheckCircle2, Sliders } from "lucide-react"
+import { Card } from "./ui/card"
+import { apiService, Scan, Task } from "@/lib/api"
 
-export class ApiError extends Error {
-  status: number;
-  detail: string;
-
-  constructor(status: number, detail: string) {
-    super(detail);
-    this.name = 'ApiError';
-    this.status = status;
-    this.detail = detail;
-  }
+interface MutationViewProps {
+  activeScan: Scan | null;
 }
 
-// Translate a raw HTTP status into an actionable, human-readable message.
-function describeStatus(status: number, detail: string): string {
-  switch (status) {
-    case 400: return detail || 'Invalid request. Check the data you submitted.';
-    case 401: return 'Authentication required. Provide a valid token or API key.';
-    case 403: return 'Access denied. You are not authorized for this resource.';
-    case 404: return detail || 'Resource not found.';
-    case 408: return 'The target server timed out. Try again.';
-    case 422: return detail || 'Validation failed. Check the request payload.';
-    case 429: return 'Rate limit exceeded. Please slow down and retry.';
-    case 502: return 'Backend server is unreachable. Ensure the FastAPI backend is running on port 8000.';
-    case 503: return detail || 'A backend dependency (database, Redis, or workers) is unavailable.';
-    case 504: return 'The backend gateway timed out while processing the request.';
-    default:
-      if (status >= 500) return detail || 'The backend encountered an internal error.';
-      return detail || `Request failed (HTTP ${status}).`;
-  }
-}
+export function MutationView({ activeScan }: MutationViewProps) {
+  const [activeStrategy, setActiveStrategy] = useState("id")
+  const [mutationQueue, setMutationQueue] = useState<any[]>([])
+  const [selectedIndex, setSelectedIndex] = useState<number>(0)
 
-async function apiFetch<T>(url: string, options?: RequestInit): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(url, options);
-  } catch (e) {
-    // A thrown fetch (TypeError "Failed to fetch") is a transport-level failure:
-    // the request never reached the backend. Surface an actionable message
-    // instead of the opaque browser default.
-    throw new ApiError(
-      0,
-      'Network connection failed: could not reach the backend API. ' +
-      'Verify the backend server is running and reachable, then retry.'
-    );
-  }
+  const strategies = [
+    { id: "id", name: "ID & BOLA Mutation", desc: "Swaps sequential object identifiers to check for Broken Object Level Authorization checks.", severity: "CRITICAL" },
+    { id: "parameter", name: "Parameter Boundary", desc: "Mutates integers to negative, zero, overflows, and floats; strings to nested structures.", severity: "MEDIUM" },
+    { id: "header", name: "Header & Auth Swaps", desc: "Modifies Host, Content-Type, and drops Authorization headers entirely to find leaks.", severity: "HIGH" },
+    { id: "json", name: "JSON Structure", desc: "Alters JSON payloads into arrays, injects key duplicates, and overrides nested claims.", severity: "HIGH" }
+  ]
 
-  if (!res.ok) {
-    let detail = '';
-    try {
-      const body = await res.json();
-      detail = body.detail || body.message || '';
-    } catch { /* response had no JSON body */ }
-    throw new ApiError(res.status, describeStatus(res.status, detail));
-  }
+  useEffect(() => {
+    const loadMutationQueue = async () => {
+      if (!activeScan) {
+        setMutationQueue([])
+        return
+      }
 
-  // Some endpoints (e.g. 204 No Content) return an empty body.
-  if (res.status === 204) return undefined as unknown as T;
-  const text = await res.text();
-  if (!text) return undefined as unknown as T;
-  try {
-    return JSON.parse(text) as T;
-  } catch {
-    throw new ApiError(res.status, 'Unable to parse the response from the backend.');
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Interfaces
-// ---------------------------------------------------------------------------
-
-export interface Scan {
-  id: string;
-  name: string;
-  target: string;
-  status: string;
-  config: any;
-  created_at: string;
-  started_at?: string;
-  finished_at?: string;
-}
-
-export interface Task {
-  id: string;
-  scan_id: string;
-  method: string;
-  url: string;
-  headers: any;
-  payload: any;
-  mutation_strategy: string | null;
-  mutation_reason: string | null;
-  status: string;
-  attempts: number;
-  max_retries: number;
-  created_at: string;
-  response?: {
-    id: string;
-    status_code: number;
-    latency_ms: number;
-    response_headers: any;
-    response_body: string;
-    error_message?: string;
-    created_at: string;
-  };
-}
-
-export interface ScanProgress {
-  scan_id: string;
-  status: string;
-  total_tasks: number;
-  completed_tasks: number;
-  failed_tasks: number;
-  pending_tasks: number;
-  detailed_stats: {
-    QUEUED: number;
-    PROCESSING: number;
-    RETRYING: number;
-    SUCCESS: number;
-    FAILED: number;
-  };
-}
-
-export interface QueueStatus {
-  critical_p1: number;
-  high_p2: number;
-  medium_p3: number;
-  low_p4: number;
-  delayed_retries: number;
-  dead_letters: number;
-  total_pending: number;
-}
-
-export interface WorkerStatus {
-  active_workers: number;
-  status: string;
-  workers: string[];
-}
-
-export interface ExecutionStats {
-  throughput: {
-    total_processed: number;
-    success: number;
-    failure: number;
-    rate_limited_429: number;
-  };
-  rates: {
-    success_rate_pct: number;
-    failure_rate_pct: number;
-    rate_limit_pct: number;
-  };
-  retries_total: number;
-}
-
-export interface JWTAnalysisResult {
-  valid: boolean;
-  header: any;
-  payload: any;
-  vulnerabilities: Array<{
-    severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
-    type: string;
-    description: string;
-    remediation: string;
-  }>;
-  risk_score: number;
-  error?: string;
-}
-
-export interface DiffResult {
-  status_differs: boolean;
-  status_a: number;
-  status_b: number;
-  body_length_differs: boolean;
-  body_length_a: number;
-  body_length_b: number;
-  json_diff_keys: string[];
-  leak_detected: boolean;
-  leak_type: string | null;
-  risk_score: number;
-  explanation: string;
-}
-
-export interface Vulnerability {
-  id: string;
-  title: string;
-  severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
-  path: string;
-  method: string;
-  description: string;
-  remediation: string;
-  cvss: number;
-  impact: string;
-  evidence?: any;
-}
-
-export interface DashboardStats {
-  total_scans: number;
-  running_scans: number;
-  completed_scans: number;
-  failed_scans: number;
-  total_endpoints: number;
-  total_vulnerabilities: number;
-  critical_count: number;
-  high_count: number;
-  medium_count: number;
-  low_count: number;
-  security_score: number;
-  risk_score: number;
-  recent_activity: Array<{
-    task_id: string;
-    method: string;
-    url: string;
-    status: string;
-    status_code?: number;
-    timestamp: string;
-  }>;
-}
-
-export interface RoleSwapResult {
-  endpoint: string;
-  method: string;
-  source_role: string;
-  target_role: string;
-  status: string;
-  bypass: boolean;
-  detail: string;
-  source_status_code?: number;
-  target_status_code?: number;
-}
-
-export interface TimelinePoint {
-  timestamp: string;
-  requests: number;
-  latency: number;
-  failures: number;
-  queue_depth: number;
-}
-
-export interface CopilotResponse {
-  answer: string;
-  evidence: any[];
-  suggestions: string[];
-}
-
-// ---------------------------------------------------------------------------
-// API Service — All methods hit live backend, no mock fallbacks
-// ---------------------------------------------------------------------------
-
-export const apiService = {
-  // ---- Scans ----
-
-  async getScans(): Promise<Scan[]> {
-    return apiFetch<Scan[]>(`${API_BASE_URL}/scans`);
-  },
-
-  async createScan(name: string, target: string, config: any = {}): Promise<Scan> {
-    return apiFetch<Scan>(`${API_BASE_URL}/scans`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, target, config }),
-    });
-  },
-
-  async deleteScan(scanId: string): Promise<void> {
-    const res = await fetch(`${API_BASE_URL}/scans/${scanId}`, { method: 'DELETE' });
-    if (!res.ok) {
-      throw new ApiError(res.status, 'Failed to delete scan');
-    }
-  },
-
-  async getScanProgress(scanId: string): Promise<ScanProgress> {
-    return apiFetch<ScanProgress>(`${API_BASE_URL}/scans/${scanId}/progress`);
-  },
-
-  async getScanTasks(scanId: string): Promise<Task[]> {
-    return apiFetch<Task[]>(`${API_BASE_URL}/scans/${scanId}/tasks`);
-  },
-
-  // ---- Discovery ----
-
-  async runDiscovery(scanId: string, specSource: string, baseUrl?: string): Promise<any> {
-    return apiFetch<any>(`${API_BASE_URL}/scans/${scanId}/discover`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ spec_source: specSource, base_url: baseUrl }),
-    });
-  },
-
-  // ---- Queue / Workers / Execution ----
-
-  async getQueueStatus(): Promise<QueueStatus> {
-    return apiFetch<QueueStatus>(`${API_BASE_URL}/queue/status`);
-  },
-
-  async getWorkerStatus(): Promise<WorkerStatus> {
-    return apiFetch<WorkerStatus>(`${API_BASE_URL}/workers/status`);
-  },
-
-  async getExecutionStats(): Promise<ExecutionStats> {
-    return apiFetch<ExecutionStats>(`${API_BASE_URL}/execution/stats`);
-  },
-
-  // ---- Reports ----
-
-  async getReport(scanId: string, format: string = 'json', type: string = 'technical'): Promise<any> {
-    return apiFetch<any>(`${API_BASE_URL}/scans/${scanId}/report?format=${format}&type=${type}`);
-  },
-
-  // ---- JWT ----
-
-  async analyzeJWT(token: string): Promise<JWTAnalysisResult> {
-    return apiFetch<JWTAnalysisResult>(`${API_BASE_URL}/jwt/analyze`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token }),
-    });
-  },
-
-  // ---- Diff ----
-
-  async runDiff(respA: { status_code: number, body: string }, respB: { status_code: number, body: string }): Promise<DiffResult> {
-    return apiFetch<DiffResult>(`${API_BASE_URL}/diff`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ response_a: respA, response_b: respB }),
-    });
-  },
-
-  // ---- Dashboard Stats ----
-
-  async getDashboardStats(): Promise<DashboardStats> {
-    return apiFetch<DashboardStats>(`${API_BASE_URL}/dashboard/stats`);
-  },
-
-  // ---- Vulnerabilities ----
-
-  async getVulnerabilities(scanId: string): Promise<Vulnerability[]> {
-    return apiFetch<Vulnerability[]>(`${API_BASE_URL}/scans/${scanId}/vulnerabilities`);
-  },
-
-  // ---- Role Swap Results ----
-
-  async getRoleSwapResults(scanId: string): Promise<RoleSwapResult[]> {
-    return apiFetch<RoleSwapResult[]>(`${API_BASE_URL}/scans/${scanId}/role-swaps`);
-  },
-
-  // ---- Scan Timeline (for live charts) ----
-
-  async getScanTimeline(scanId: string): Promise<TimelinePoint[]> {
-    return apiFetch<TimelinePoint[]>(`${API_BASE_URL}/scans/${scanId}/timeline`);
-  },
-
-  // ---- AI Copilot ----
-
-  async askCopilot(scanId: string | undefined, query: string, contextView: string): Promise<CopilotResponse> {
-    return apiFetch<CopilotResponse>(`${API_BASE_URL}/copilot/ask`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ scan_id: scanId, query, context_view: contextView }),
-    });
-  },
-
-  // ---- SSE Stream Subscription ----
-
-  subscribeScanStream(scanId: string, onMessage: (data: any) => void): EventSource {
-    const source = new EventSource(`${API_BASE_URL}/stream/scan/${scanId}`);
-    source.onmessage = (event) => {
       try {
-        const data = JSON.parse(event.data);
-        onMessage(data);
-      } catch { /* ignore parse errors */ }
-    };
-    return source;
-  }
-};
+        const tasks = await apiService.getScanTasks(activeScan.id)
+        const fuzzTasks = tasks.filter(t => t.payload || t.url.includes("=") || t.method !== "GET")
+
+        const queue = fuzzTasks.map(task => {
+          const strategy = task.mutation_strategy || "Recon Probe"
+          const payloadKeys = Object.keys(task.payload || {})
+          const firstKey = payloadKeys[0] || "param"
+          const firstVal = task.payload?.[firstKey]
+          return {
+            path: task.url,
+            param: firstKey,
+            original: "(original)",
+            mutated: firstVal !== undefined ? String(firstVal) : task.url,
+            original_full: task.payload || { url: task.url },
+            mutated_full: task.payload || { url: task.url },
+            strategy,
+            reason: task.mutation_reason || "",
+            status: task.status,
+            priority: "P4",
+          }
+        })
+
+        setMutationQueue(queue)
+        setSelectedIndex(0)
+      } catch (err) {
+        console.error('Unable to load mutation queue from active scan', err)
+      }
+    }
+
+    loadMutationQueue()
+  }, [activeScan])
+
+  const selectedItem = mutationQueue[selectedIndex]
+
+  return (
+    <div className="space-y-6">
+      {/* Banner */}
+      <div className="bg-gradient-to-r from-white to-slate-50 p-8 rounded-2xl border border-border flex items-center justify-between shadow-sm relative overflow-hidden">
+        <div className="absolute top-0 right-0 w-64 h-64 bg-primary/5 rounded-full blur-3xl pointer-events-none -translate-y-1/2 translate-x-1/3"></div>
+
+        <div className="relative z-10">
+          <h2 className="text-2xl font-black tracking-tight text-foreground flex items-center gap-3">
+            <div className="p-2.5 bg-primary/10 rounded-xl border border-primary/20 shadow-sm">
+              <Cpu className="w-6 h-6 text-primary" />
+            </div>
+            Parameter Mutation Engine
+          </h2>
+          <p className="text-sm text-secondary font-medium mt-2">
+            Generate mutated fuzzing payloads from endpoint definitions to locate validation holes.
+          </p>
+          {activeScan && (
+            <p className="text-xs text-primary font-bold mt-2.5 flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-primary animate-pulse"></span>
+              Live task queue for {activeScan.name} ({activeScan.status})
+            </p>
+          )}
+        </div>
+      </div>
+
+      {/* Strategies list & details */}
+      <div className="grid gap-6 md:grid-cols-3">
+        {/* Left selector */}
+        <Card className="md:col-span-1 h-full flex flex-col">
+          <h3 className="font-extrabold text-foreground text-sm flex items-center gap-2 mb-6 border-b border-border/60 pb-4 uppercase tracking-wide">
+            <Sliders className="w-4 h-4 text-primary" />
+            Fuzzing Strategies
+          </h3>
+          
+          <div className="space-y-3 flex-1">
+            {strategies.map(st => (
+              <button
+                key={st.id}
+                onClick={() => setActiveStrategy(st.id)}
+                className={`w-full text-left p-4 rounded-xl border transition-all cursor-pointer shadow-sm group ${
+                  activeStrategy === st.id 
+                    ? 'bg-primary/5 border-primary/30 ring-1 ring-primary/20' 
+                    : 'bg-white border-border/80 hover:border-primary/20 hover:shadow-md'
+                }`}
+              >
+                <div className="flex justify-between items-center mb-2">
+                  <span className={`text-sm font-black tracking-tight ${activeStrategy === st.id ? 'text-primary' : 'text-foreground group-hover:text-primary transition-colors'}`}>{st.name}</span>
+                  <span className={`text-[9px] px-2 py-1 rounded-lg font-black uppercase tracking-widest shadow-sm border ${
+                    st.severity === 'CRITICAL' ? 'bg-destructive/10 text-destructive border-destructive/20' :
+                    st.severity === 'HIGH' ? 'bg-warning/10 text-warning border-warning/20' : 'bg-info/10 text-info border-info/20'
+                  }`}>
+                    {st.severity}
+                  </span>
+                </div>
+                <p className="text-[11px] text-secondary font-medium leading-relaxed">{st.desc}</p>
+              </button>
+            ))}
+          </div>
+        </Card>
+
+        {/* Mutation Preview comparison */}
+        <Card className="md:col-span-2 h-full flex flex-col">
+          <h3 className="font-extrabold text-foreground text-sm flex items-center gap-2 mb-6 border-b border-border/60 pb-4 uppercase tracking-wide">
+            <Zap className="w-4 h-4 text-secondary" />
+            Active Payload Previews
+          </h3>
+
+          {selectedItem ? (
+            <div className="grid md:grid-cols-2 gap-6 text-xs font-medium flex-1">
+              <div className="space-y-3 flex flex-col h-full">
+                <span className="text-secondary font-bold uppercase tracking-widest text-[10px] flex items-center gap-1.5 bg-slate-50 border border-border/60 px-3 py-1.5 rounded-lg w-fit">
+                  <Layers className="w-3.5 h-3.5 text-secondary" />
+                  Original Payload
+                </span>
+                <pre className="flex-1 bg-[#0A0F1C] border border-slate-800 p-5 rounded-2xl font-mono text-[11px] text-slate-300 whitespace-pre overflow-x-auto shadow-inner custom-scrollbar min-h-[150px]">
+                  {typeof selectedItem.original_full === 'object' 
+                    ? JSON.stringify(selectedItem.original_full, null, 2) 
+                    : selectedItem.original_full}
+                </pre>
+              </div>
+
+              <div className="space-y-3 flex flex-col h-full">
+                <span className="text-destructive font-bold uppercase tracking-widest text-[10px] flex items-center gap-1.5 bg-destructive/5 border border-destructive/10 px-3 py-1.5 rounded-lg w-fit">
+                  <ShieldAlert className="w-3.5 h-3.5 text-destructive" />
+                  Mutated Fuzz Payload
+                </span>
+                <pre className="flex-1 bg-[#0A0F1C] border border-destructive/40 p-5 rounded-2xl font-mono text-[11px] text-destructive-foreground whitespace-pre overflow-x-auto shadow-inner custom-scrollbar relative min-h-[150px]">
+                  <div className="absolute inset-0 bg-destructive/5 pointer-events-none"></div>
+                  {typeof selectedItem.mutated_full === 'object' 
+                    ? JSON.stringify(selectedItem.mutated_full, null, 2) 
+                    : selectedItem.mutated_full}
+                </pre>
+              </div>
+
+              {selectedItem.reason && (
+                <div className="md:col-span-2 mt-2 bg-slate-50 border border-border/60 rounded-xl px-4 py-3 text-[11px] text-secondary font-medium">
+                  <span className="font-bold text-foreground uppercase tracking-widest text-[10px]">Engine Reason: </span>
+                  {selectedItem.reason}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="flex-1 flex items-center justify-center border border-dashed border-border rounded-2xl text-xs text-secondary font-bold uppercase tracking-widest p-8">
+              No active payload mutations in the current scan tasks.
+            </div>
+          )}
+        </Card>
+      </div>
+
+      {/* Mutation queue table */}
+      <Card>
+        <div className="flex justify-between items-center mb-6 border-b border-border/60 pb-4">
+          <h3 className="font-extrabold text-foreground text-sm flex items-center gap-2 uppercase tracking-wide">
+            <Layers className="w-4 h-4 text-primary" />
+            Generated Mutation Fuzz Queue
+          </h3>
+          <span className="text-[11px] bg-primary/10 text-primary px-3 py-1.5 rounded-full font-black tracking-widest uppercase border border-primary/20 shadow-sm">{mutationQueue.length} Mutations In Queue</span>
+        </div>
+
+        {mutationQueue.length === 0 ? (
+          <div className="text-center py-16 text-xs text-secondary font-bold uppercase tracking-widest border border-dashed border-2 border-border rounded-2xl">
+            No mutation tasks generated for this scan. Make sure the target API has endpoints with parameters.
+          </div>
+        ) : (
+          <div className="overflow-x-auto custom-scrollbar pb-2">
+            <table className="w-full text-left text-xs font-medium">
+              <thead>
+                <tr className="border-b border-border/60 text-secondary font-bold text-[10px] uppercase tracking-widest">
+                  <th className="py-3 px-2">Endpoint</th>
+                  <th className="py-3 px-2">Target Param</th>
+                  <th className="py-3 px-2">Original</th>
+                  <th className="py-3 px-2">Mutated Fuzz</th>
+                  <th className="py-3 px-2">Strategy</th>
+                  <th className="py-3 px-2 text-right">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {mutationQueue.map((mut, idx) => (
+                  <tr 
+                    key={idx} 
+                    onClick={() => setSelectedIndex(idx)}
+                    className={`border-b border-border/40 hover:bg-slate-50/50 transition-colors group cursor-pointer ${selectedIndex === idx ? 'bg-slate-50 font-bold' : ''}`}
+                  >
+                    <td className="py-4 px-2 font-mono text-[11px] text-foreground font-semibold truncate max-w-[150px]">{mut.path}</td>
+                    <td className="py-4 px-2 font-bold text-secondary">{mut.param}</td>
+                    <td className="py-4 px-2 font-mono text-[11px] text-muted truncate max-w-[100px]">{mut.original}</td>
+                    <td className="py-4 px-2">
+                      <span className="font-mono text-[11px] text-destructive font-black bg-destructive/10 border border-destructive/20 px-2 py-1 rounded-lg truncate max-w-[150px] inline-block">{mut.mutated}</span>
+                    </td>
+                    <td className="py-4 px-2 text-[11px] font-semibold text-secondary">{mut.strategy}</td>
+                    <td className="py-4 px-2 text-right">
+                      <span className={`text-[9px] px-2.5 py-1.5 rounded-lg font-black uppercase tracking-widest shadow-sm border ${
+                        mut.status === 'SUCCESS' ? 'bg-success/10 text-success border-success/20' :
+                        mut.status === 'PROCESSING' ? 'bg-primary/10 text-primary border-primary/20 animate-pulse' : 'bg-slate-100 text-secondary border-border/60'
+                      }`}>
+                        {mut.status}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+    </div>
+  )
+}
